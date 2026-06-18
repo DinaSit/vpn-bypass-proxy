@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+__MACOSX/
+
+# Runtime files
+chrome-profile/
+proxy.log
+proxy.pid
+proxy.pac
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
