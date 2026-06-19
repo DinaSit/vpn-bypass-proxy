@@ -142,7 +142,7 @@ def handle_connect(client: socket.socket, target: str):
         port = 443
 
     bypass = should_bypass_vpn(host)
-    route = "BYPASS_VPN_VIA_EN0" if bypass else "DEFAULT_VPN"
+    route = "BYPASS_VPN_VIA_WIFI" if bypass else "DEFAULT_VPN"
 
     print(f"[https host] {host}")
     print(f"[route] {route}")
@@ -182,7 +182,7 @@ def handle_http(client: socket.socket, data: bytes):
         path += "?" + parsed.query
 
     bypass = should_bypass_vpn(host)
-    route = "BYPASS_VPN_VIA_EN0" if bypass else "DEFAULT_VPN"
+    route = "BYPASS_VPN_VIA_WIFI" if bypass else "DEFAULT_VPN"
 
     print(f"[http host] {host}")
     print(f"[route] {route}")
