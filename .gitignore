@@ -6,7 +6,8 @@ __MACOSX/
 chrome-profile/
 proxy.log
 proxy.pid
-proxy.pac
+proxy
+a.out
 
 # Python
 __pycache__/

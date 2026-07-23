@@ -3,10 +3,10 @@ import select
 import socket
 import subprocess
 import threading
+import time
 from urllib.parse import urlparse
 
-# Прокси доступен локально 
-# Внешние устройства в сети не могут подключиться к 127.0.0.1.
+# Прокси доступен локально на порту 18080
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 18080
 
@@ -53,9 +53,12 @@ def detect_wifi_interface() -> str:
     return "en0"
 
 
-# macOS-специфичная опция сокета.
-# Используется для привязки исходящего IPv4-соединения к конкретному интерфейсу.
-IP_BOUND_IF = 25
+# Номера опций «привязать соединение к интерфейсу» из заголовков macOS:
+# IPv4 → IP_BOUND_IF (25), IPv6 → IPV6_BOUND_IF (125).
+BOUND_IF = {
+    socket.AF_INET:  (socket.IPPROTO_IP,   25),
+    socket.AF_INET6: (socket.IPPROTO_IPV6, 125),
+}
 
 # Интерфейс, через который выполняется обход VPN.
 # По умолчанию определяется автоматически как Wi-Fi-интерфейс macOS.
@@ -73,25 +76,65 @@ def should_bypass_vpn(host: str | None) -> bool:
         return False
 
     host = host.lower()
-    return host.endswith(".ru") or host.endswith(".рф")
+    return host.endswith(".ru") or host.endswith(".xn--p1ai") # .рф в Punycode
 
 
 def open_socket(host: str, port: int, bypass_vpn: bool) -> socket.socket:
     """
-    Создаёт TCP-соединение с удалённым узлом.
+    Создаёт TCP-соединение с удалённым узлом (Happy Eyeballs).
 
-    При bypass_vpn=True соединение привязывается к IFACE.
-    При bypass_vpn=False используется стандартная маршрутизация ОС.
+    Резолвит host в список адресов (IPv4 и IPv6), пробует подключиться
+    ко всем сразу и возвращает первый успешный. При bypass_vpn=True каждое
+    соединение привязывается к IFACE (мимо VPN).
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(15)
+    candidates = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
 
-    if bypass_vpn:
-        idx = socket.if_nametoindex(IFACE)
-        s.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, idx)
+    # 1. Запускаем неблокирующий connect на каждый адрес сразу
+    pending = []
+    for family, socktype, proto, _, addr in candidates:
+        s = socket.socket(family, socktype, proto)
+        try:
+            s.setblocking(False)
+            if bypass_vpn:
+                level, optname = BOUND_IF[family]
+                s.setsockopt(level, optname, socket.if_nametoindex(IFACE))
+            s.connect_ex(addr)
+        except BaseException:
+            # упало на настройке (например, интерфейс исчез) —
+            # закрываем этот и все уже запущенные сокеты, чтобы не текло
+            s.close()
+            for p in pending:
+                p.close()
+            raise
+        pending.append(s)
 
-    s.connect((host, port))
-    return s
+    # 2. Ждём, кто первым подключится (сокет становится writable по завершении connect)
+    deadline = time.monotonic() + 15
+    winner = None
+    while pending and winner is None:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            break
+        _, writable, _ = select.select([], pending, [], timeout)
+        for s in writable:
+            err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err == 0:
+                winner = s
+                break
+            s.close()
+            pending.remove(s)
+
+    # 3. Закрываем остальных
+    for s in pending:
+        if s is not winner:
+            s.close()
+
+    if winner is None:
+        raise OSError(f"не удалось подключиться ни к одному адресу {host}:{port}")
+
+    winner.setblocking(True)
+    winner.settimeout(15)
+    return winner
 
 
 def relay(a: socket.socket, b: socket.socket):
@@ -101,12 +144,13 @@ def relay(a: socket.socket, b: socket.socket):
     Используется для HTTPS CONNECT-туннеля.
     TLS-трафик не расшифровывается и не модифицируется.
     """
-    a.setblocking(False)
-    b.setblocking(False)
-
     sockets = [a, b]
 
     while True:
+        # select.select() возвращает три списка сокетов:
+        # readable - готовые к чтению,
+        # writable - готовые к записи (не используется),
+        # errored - с ошибками
         readable, _, errored = select.select(sockets, [], sockets, 60)
 
         if errored:
@@ -116,9 +160,11 @@ def relay(a: socket.socket, b: socket.socket):
             break
 
         for src in readable:
+            # Определяем, какой сокет является источником, а какой - приёмником
             dst = b if src is a else a
 
             try:
+                # Читаем данные из источника и отправляем их в приёмник
                 data = src.recv(65536)
                 if not data:
                     return
@@ -148,15 +194,15 @@ def handle_connect(client: socket.socket, target: str):
     print(f"[route] {route}")
 
     upstream = open_socket(host, port, bypass)
-
-    client.sendall(
-        b"HTTP/1.1 200 Connection Established\r\n"
-        b"Connection: close\r\n"
-        b"\r\n"
-    )
-
-    relay(client, upstream)
-    upstream.close()
+    try:
+        client.sendall(
+            b"HTTP/1.1 200 Connection Established\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        )
+        relay(client, upstream)
+    finally:
+        upstream.close()
 
 
 def handle_http(client: socket.socket, data: bytes):
@@ -164,7 +210,8 @@ def handle_http(client: socket.socket, data: bytes):
     Обрабатывает обычный HTTP-запрос в proxy-формате.
 
     Абсолютный URL из первой строки запроса преобразуется в origin-form
-    перед отправкой на upstream-сервер.
+    перед отправкой на upstream-сервер
+    * не сильно паримся, потому что http не оч нужен, и большинство сайтов уже используют https
     """
     header, _, body = data.partition(b"\r\n\r\n")
     lines = header.split(b"\r\n")
@@ -187,20 +234,48 @@ def handle_http(client: socket.socket, data: bytes):
     print(f"[http host] {host}")
     print(f"[route] {route}")
 
+    # Преобразуем первую строку запроса в origin-form
     new_first_line = f"{method} {path} {version}".encode("latin1")
-    new_header = b"\r\n".join([new_first_line] + lines[1:])
+    # Убираем заголовки Connection и Proxy-Connection, 
+    # чтобы upstream-сервер не пытался поддерживать соединение открытым
+    kept = [
+        line for line in lines[1:]
+        if not line.lower().startswith((b"connection:", b"proxy-connection:"))
+    ]
+    kept.append(b"Connection: close")
+    # хороший keep-alive потребовал бы разбор ответа сервера, chunked-декодер, цикл и обработку краевых случаев, 
+    # но мне лень, так что просто закрываем соединение после каждого запроса
+
+    # Собираем новый заголовок и тело запроса
+    # Сколько тела обещано в заголовках:
+    content_length = 0
+    for line in lines[1:]:
+        if line.lower().startswith(b"content-length:"):
+            content_length = int(line.split(b":", 1)[1])
+            break
+
+    # Тело могло прийти не целиком (один recv в handle_client берёт максимум 64КБ и только те пакеты, что уже дошли) 
+    # Дочитываем, пока не наберём полный Content-Length
+    while len(body) < content_length:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+
+    # Теперь тело целиком — собираем запрос и отправляем на upstream-сервер
+    new_header = b"\r\n".join([new_first_line] + kept)
     new_data = new_header + b"\r\n\r\n" + body
 
     upstream = open_socket(host, port, bypass)
-    upstream.sendall(new_data)
-
-    while True:
-        chunk = upstream.recv(65536)
-        if not chunk:
-            break
-        client.sendall(chunk)
-
-    upstream.close()
+    try:
+        upstream.sendall(new_data)
+        while True:
+            chunk = upstream.recv(65536)
+            if not chunk:
+                break
+            client.sendall(chunk)
+    finally:
+        upstream.close()
 
 
 def handle_client(client: socket.socket):
@@ -260,7 +335,12 @@ def main():
 
     try:
         while True:
-            client, _ = server.accept()
+            try:
+                client, _ = server.accept()
+            except OSError as e:
+                print(f"[error] accept: {e}")
+                time.sleep(0.1)   # дать дескрипторам освободиться
+                continue
             threading.Thread(target=handle_client, args=(client,), daemon=True).start()
     except KeyboardInterrupt:
         print("\nProxy stopped")

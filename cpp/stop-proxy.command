@@ -1,6 +1,6 @@
 #!/bin/zsh
 
-PROJECT_DIR="$HOME/vpn-bypass-proxy"
+PROJECT_DIR="${0:A:h}"
 PROXY_PORT="18080"
 PID_FILE="$PROJECT_DIR/proxy.pid"
 
