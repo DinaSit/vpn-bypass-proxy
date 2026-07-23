@@ -41,7 +41,7 @@ cd go                    # или cpp / python
 ./clean-data.command     # закрыть Chrome, снести профиль и логи
 ```
 
-Двойной клик из Finder тоже работает. В папке появятся `proxy.log`, `proxy.pid`, `chrome-profile/` и бинарник `proxy` — всё в `.gitignore`.
+Двойной клик из Finder тоже работает. В папке появятся `proxy.log`, `proxy.pid`, `chrome-profile/` и бинарник `proxy`.
 
 ## Как убедиться, что работает
 
@@ -82,7 +82,7 @@ tail -f proxy.log
 
 ## Если не работает
 
-| Симптом | Причина и что делать |
+| Признак | Причина и что делать |
 |---------|----------------------|
 | `Proxy is already running` | порт занят прошлым запуском: `./stop-proxy.command`, при необходимости проверить `lsof -nP -iTCP:18080 -sTCP:LISTEN` |
 | Chrome открылся, но сайты не грузятся | прокси не поднялся — смотреть `proxy.log` |
